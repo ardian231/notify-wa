@@ -2,16 +2,10 @@ const express = require('express');
 require('dotenv').config();
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const dotenv = require('dotenv');
-const Groq = require('groq-sdk');
+const axios = require('axios');
 const serviceAccount = require('./firebase-key.json');
 
 console.log('GROQ_API_KEY:', process.env.GROQ_API_KEY ? '[FOUND]' : '[NOT FOUND]');
-
-
-// === Load .env ===
-
-dotenv.config();
 
 // === Init Express ===
 const app = express();
@@ -21,8 +15,83 @@ app.use(express.json());
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore(); // Firestore
 
-// === GROQ Init ===
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// === Model fallback dan kuota tracking ===
+const models = [
+  "llama3-70b-8192",
+  "gemma2-9b-it",
+  "llama-guard-3-8b",
+  "llama3-8b-8192",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "compound-beta"
+];
+
+const modelQuotaStatus = models.reduce((acc, model) => {
+  acc[model] = { remainingRequests: Infinity, remainingTokens: Infinity, retryAfter: 0 };
+  return acc;
+}, {});
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function updateQuotaStatus(model, headers) {
+  if (!headers) return;
+  const quota = modelQuotaStatus[model];
+  if (!quota) return;
+  if (headers['x-ratelimit-remaining-requests']) {
+    quota.remainingRequests = parseInt(headers['x-ratelimit-remaining-requests'], 10);
+  }
+  if (headers['x-ratelimit-remaining-tokens']) {
+    quota.remainingTokens = parseInt(headers['x-ratelimit-remaining-tokens'], 10);
+  }
+  if (headers['retry-after']) {
+    const retryAfterSec = parseInt(headers['retry-after'], 10);
+    quota.retryAfter = Date.now() + retryAfterSec * 1000;
+  }
+}
+
+async function requestWithFallback(requestData) {
+  const now = Date.now();
+  for (const model of models) {
+    const quota = modelQuotaStatus[model];
+    if (quota.retryAfter > now) {
+      console.log(`[RateLimit] Model ${model} sedang cooldown sampai ${new Date(quota.retryAfter).toLocaleTimeString()}`);
+      continue;
+    }
+    try {
+      const response = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          model: model,
+          messages: requestData.messages,
+          temperature: requestData.temperature ?? 0.2
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+          }
+        }
+      );
+
+      updateQuotaStatus(model, response.headers);
+      console.log(`[Success] Response dari model: ${model}`);
+      return response.data;
+
+    } catch (error) {
+      if (error.response && error.response.status === 429) {
+        const retryAfterSec = parseInt(error.response.headers['retry-after'] || '60', 10);
+        quota.retryAfter = Date.now() + retryAfterSec * 1000;
+        quota.remainingRequests = 0;
+        quota.remainingTokens = 0;
+        console.warn(`[RateLimit] Model ${model} kena limit. Retry setelah ${retryAfterSec} detik.`);
+        continue;
+      } else {
+        console.error(`[Error] Model ${model} gagal dengan error:`, error.message);
+        throw error;
+      }
+    }
+  }
+  throw new Error("Semua model kena rate limit, coba lagi nanti.");
+}
 
 // === Endpoint chatbot ===
 app.post('/api/chatbot', async (req, res) => {
@@ -50,8 +119,7 @@ Jika pesan tidak sesuai atau tidak jelas, balas 'default'.
 `;
 
   try {
-    const response = await groq.chat.completions.create({
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+    const response = await requestWithFallback({
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: message }
@@ -81,11 +149,10 @@ Jika pesan tidak sesuai atau tidak jelas, balas 'default'.
     }
 
   } catch (err) {
-    console.error('❌ Error:', err);
+    console.error('❌ Error:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-
 
 // === Start server ===
 const PORT = process.env.PORT || 3000;
