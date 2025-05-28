@@ -101,25 +101,37 @@ const kirimPesan = async (rawNumber, message, tag = '') => {
 
 
 // === Event Handler DB ===
+
+// === Mapping status dari Realtime DB (inggris) ke nama dokumen template (indonesia) ===
+const statusMap = {
+  pending: 'default',
+  process: 'diproses',
+  approve: 'diterima',
+  cancel: 'dibatalkan',
+  reject: 'ditolak',
+};
+
+// === Event Handler DB ===
 const handleRealtimeEvents = () => {
   // Pesan saat order baru masuk
   db.ref('orders').on('child_added', async (snap) => {
-  console.log('child_added orders event triggered', snap.key);
-  const data = snap.val();
-  if (!data?.phone || !data?.name) {
-    console.log('Data tidak lengkap:', data);
-    return;
-  }
-  const msg = await getMessageTemplate('order_added', { name: data.name });
-  console.log('Template pesan:', msg);
-  if (msg) {
-    console.log(`Mengirim pesan ke ${data.phone}`);
-    await kirimPesan(data.phone, msg, `order_added_${snap.key}`);
-  } else {
-    console.log('Pesan template kosong, skip kirim pesan');
-  }
-});
+    console.log('child_added orders event triggered', snap.key);
+    const data = snap.val();
+    if (!data?.phone || !data?.name) {
+      console.log('Data tidak lengkap:', data);
+      return;
+    }
 
+    const msg = await getMessageTemplate('order_added', { name: data.name });
+    console.log('Template pesan:', msg);
+
+    if (msg) {
+      console.log(`Mengirim pesan ke ${data.phone}`);
+      await kirimPesan(data.phone, msg, `order_added_${snap.key}`);
+    } else {
+      console.log('Pesan template kosong, skip kirim pesan');
+    }
+  });
 
   // Pesan saat status order berubah
   db.ref('orders').on('child_changed', async (snap) => {
@@ -127,11 +139,16 @@ const handleRealtimeEvents = () => {
     if (!data?.phone || !data?.status || !data?.name) return;
 
     const status = data.status.toLowerCase();
+    const statusIndo = statusMap[status] || status;
     const tag = `order_changed_${snap.key}_${status}`;
 
-    // Pakai template order_status_{status}
-    const customerMsg = await getMessageTemplate(`order_status_${status}`, { name: data.name });
-    const agentMsg = await getMessageTemplate(`order_status_${status}`, { name: data.name });
+    console.log(`Status berubah: ${status} → ${statusIndo}`);
+
+    // Ambil template untuk customer
+    const customerMsg = await getMessageTemplate(`order_status_${statusIndo}`, { name: data.name });
+
+    // Ambil template untuk agen (jika ada)
+    const agentMsg = await getMessageTemplate(`order_status_${statusIndo}`, { name: data.name });
 
     if (customerMsg) await kirimPesan(data.phone, customerMsg, `${tag}_cust`);
     if (agentMsg && data.agentPhone) await kirimPesan(data.agentPhone, agentMsg, `${tag}_agent`);
@@ -141,6 +158,7 @@ const handleRealtimeEvents = () => {
   db.ref('agent-form').on('child_added', async (snap) => {
     const data = snap.val();
     if (!data?.phone || !data?.fullName) return;
+
     const msg = await getMessageTemplate('agent_added', { name: data.fullName });
     if (msg) await kirimPesan(data.phone, msg, `agent_added_${snap.key}`);
   });
@@ -151,8 +169,14 @@ const handleRealtimeEvents = () => {
     if (!data?.phone || !data?.status || !data?.fullName) return;
 
     const status = data.status.toLowerCase();
-    const msg = await getMessageTemplate(`agent_status_${status}`, { name: data.fullName });
-    if (msg) await kirimPesan(data.phone, msg, `agent_changed_${snap.key}_${status}`);
+    const statusIndo = statusMap[status] || status;
+    const tag = `agent_changed_${snap.key}_${status}`;
+
+    console.log(`Status agen berubah: ${status} → ${statusIndo}`);
+
+    const msg = await getMessageTemplate(`agent_status_${statusIndo}`, { name: data.fullName });
+
+    if (msg) await kirimPesan(data.phone, msg, tag);
   });
 };
 
